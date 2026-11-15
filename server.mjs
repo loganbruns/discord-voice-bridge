@@ -502,7 +502,10 @@ function playerIdle() {
 }
 
 async function speakText(text) {
-  if (!connection) throw new Error("not connected");
+  // both are nulled together in teardownConnection(); checking both closes
+  // the race where the channel empties mid-reply between this check and
+  // playerIdle()'s player.state access
+  if (!connection || !player) throw new Error("not connected");
   // piper -> 22.05k mono wav -> 48k stereo s16le for @discordjs/voice
   const pwav = `${tmpName("tts")}.wav`;
   await runPiper(["--model", PIPER_MODEL, "--output_file", pwav], { stdin: text, timeoutMs: 120_000 });
