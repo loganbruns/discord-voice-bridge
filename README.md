@@ -131,7 +131,7 @@ as a starting point.
   sessions on the `user` field and carries the persona/tools itself).
   History resets whenever the bot leaves the channel.
 
-## Limitations (honest list)
+## Limitations
 
 - No wake word: it transcribes **everyone** in the channel whenever it is
   joined, and there is no push-to-talk gate. Use a private channel.
