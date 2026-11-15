@@ -1,0 +1,24 @@
+# Example user systemd unit (~/.config/systemd/user/discord-voice-bridge.service).
+#
+#   1. Adjust the three %h/... paths below to where you put the repo and env file.
+#   2. chmod 600 the env file (it holds the bot token).
+#   3. systemctl --user daemon-reload
+#      systemctl --user enable --now discord-voice-bridge.service
+#   4. journalctl --user -u discord-voice-bridge -f
+#
+# %h expands to your home directory.
+
+[Unit]
+Description=Discord voice bridge (local STT + OpenAI-compatible LLM + local TTS)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/node %h/discord-voice-bridge/server.mjs
+WorkingDirectory=%h/discord-voice-bridge
+EnvironmentFile=%h/discord-voice-bridge/bridge.env
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

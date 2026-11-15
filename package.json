@@ -1,0 +1,23 @@
+{
+  "name": "discord-voice-bridge",
+  "version": "0.1.0",
+  "description": "Small local-first bridge that gives one Discord voice channel a spoken conversation loop: whisper.cpp STT, any OpenAI-compatible chat endpoint, piper TTS.",
+  "type": "module",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs",
+    "test:pcm": "node tools/pcm-check.mjs",
+    "test:stt": "node tools/stt-test.mjs",
+    "debug:join": "node tools/debug-join.mjs"
+  },
+  "engines": {
+    "node": ">=20.6.0"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@discordjs/opus": "^0.10.0",
+    "@discordjs/voice": "^0.19.2",
+    "discord.js": "^14.28.1",
+    "libsodium-wrappers": "^0.7.15"
+  }
+}
