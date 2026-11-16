@@ -83,6 +83,9 @@ the ones you will actually touch:
 | `LLM_BASE_URL` | OpenAI-compatible endpoint (default: local Ollama) |
 | `LLM_MODEL` | model name as the endpoint knows it |
 | `LLM_KEEP_HISTORY` | `1` bridge keeps the conversation (default, for stateless endpoints); `0` endpoint keeps it (openclaw's gateway, keyed on `LLM_USER`) |
+| `LLM_MODEL_HEADER` + `LLM_MODEL_OVERRIDE` | send the model as an extra header too, for backends that override per request (openclaw: `x-openclaw-model`) |
+| `SPEAK_CHANNEL_MESSAGES` | `1` = also speak the bot's own posts in the voice channel's text chat (announce path for agent backends) |
+| `SPEAK_GAP_DROP_MS` | agent-loop backends stream between-tools narration as plain text; a silence longer than this (ms) between deltas marks a tool round, and the unsent queue is dropped so only the final answer is spoken (see below) |
 | `WHISPER_MODEL` | ggml model path |
 | `PIPER_MODEL` | piper `.onnx` voice path |
 | `VOICE_HINT` | the speaking-style prompt (short spoken replies, no markdown) |
@@ -112,6 +115,12 @@ node --env-file=.env tools/debug-join.mjs      # raw connection log (4017 check)
 server itself. Run under systemd with `systemd/discord-voice-bridge.service`
 as a starting point.
 
+One-token note for the test modes: if another process is already logged in
+with the same bot token (say, the live service), the test instance's voice
+join never completes — Discord delivers the voice session events to the
+other gateway connection, and the test dies after 30s waiting to get ready.
+Stop the other instance first.
+
 ## How it works
 
 - **Segmentation** is heuristic: Discord's speaking events start a capture,
@@ -130,6 +139,33 @@ as a starting point.
   [openclaw](https://github.com/openclaw/openclaw)'s gateway, which keys
   sessions on the `user` field and carries the persona/tools itself).
   History resets whenever the bot leaves the channel.
+
+### Pointing it at an agent (e.g. openclaw)
+
+If the endpoint doesn't just complete text but runs a tool-using agent,
+two things change:
+
+- **The stream carries the agent's between-tools narration** ("Now checking
+  the thermostat...") as ordinary text, and there is no marker separating
+  tool rounds from the final answer. Set `SPEAK_GAP_DROP_MS=2000`: token
+  deltas arrive in milliseconds while tools take seconds, so any silence
+  longer than the threshold marks a tool round — the bridge drops everything
+  queued but unspoken and restarts, speaking only what follows the last tool
+  call. Keep the hint strict too ("write no reply text before, between, or
+  during tool calls") so a well-behaved model never narrates at all.
+- **Background work finishes outside the stream.** An agent you ask (by
+  voice) to go off and research something has nothing to speak into when it
+  finishes. With `SPEAK_CHANNEL_MESSAGES=1`, the bridge also speaks any
+  message the bot itself posts to the voice channel's text chat — so the
+  agent can post a one-line "done, sent you the details" there and the
+  channel hears it.
+
+For openclaw's gateway specifically: `LLM_BASE_URL` at the gateway,
+`LLM_MODEL=openclaw/<agent>`, `LLM_KEEP_HISTORY=0`, `LLM_USER` picks the
+session, and `LLM_MODEL_HEADER=x-openclaw-model` +
+`LLM_MODEL_OVERRIDE=<model>` pins a per-request model (handy when the
+agent's default reasons for minutes before answering). The override needs
+the target model to be allowed by the agent's model policy.
 
 ## Limitations
 

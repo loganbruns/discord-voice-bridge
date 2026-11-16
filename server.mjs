@@ -72,6 +72,13 @@ const LLM_USER = env("LLM_USER", "discord-voice");
 //      keyed on the `user` field) — only the newest message is sent.
 const LLM_KEEP_HISTORY = env("LLM_KEEP_HISTORY", "1") === "1";
 const HISTORY_MAX_MESSAGES = num("HISTORY_MAX_MESSAGES", 40);
+// Optional per-request model override. Some backends key the model on a
+// request header instead of just the body's `model` field — openclaw's
+// gateway, for instance, takes `model: openclaw/<agent>` to pick the agent
+// and an `x-openclaw-model` header to override the model for that request.
+// Set both LLM_MODEL_HEADER (header name) and LLM_MODEL_OVERRIDE (value).
+const LLM_MODEL_HEADER = env("LLM_MODEL_HEADER", "");
+const LLM_MODEL_OVERRIDE = env("LLM_MODEL_OVERRIDE", "");
 
 const VOICE_HINT = env(
   "VOICE_HINT",
@@ -100,6 +107,21 @@ const TURN_MAX_MS = num("TURN_MAX_MS", 420000);
 
 // Verbose connection/DAVE + stream debug (env DEBUG_VOICE=1)
 const DEBUG_VOICE = env("DEBUG_VOICE", "") === "1";
+// Speak bot-authored messages posted to the voice channel's text chat — the
+// announce path when the backend is an agent (e.g. openclaw) that posts
+// background-work results there. Adds the GuildMessages intent; only the
+// bot's OWN posts in that one channel are spoken.
+const SPEAK_CHANNEL_MESSAGES = env("SPEAK_CHANNEL_MESSAGES", "") === "1";
+// Backends that run a tool-using agent loop (e.g. openclaw's gateway) stream
+// the model's between-tools narration as ordinary text — with no marker
+// separating tool rounds, a multi-tool turn would get its progress notes
+// spoken aloud. A silence longer than SPEAK_GAP_DROP_MS between content
+// deltas means a tool round just ran (token deltas arrive in milliseconds;
+// tools take seconds): drop everything queued but not yet spoken and restart
+// the sentence buffer, so only the text after the last tool call — the
+// actual answer — is spoken. One line already mid-playback may leak
+// through. 0 (default) disables; 2000 is a good value when it applies.
+const SPEAK_GAP_DROP_MS = num("SPEAK_GAP_DROP_MS", 0);
 // Test mode: join immediately (even with nobody there), say HELLO_LINE, leave.
 const FORCE_JOIN = env("FORCE_JOIN", "") === "1";
 const HELLO_LINE = env("HELLO_LINE", "Discord voice bridge online.");
@@ -180,7 +202,9 @@ async function runPiper(args, opts) {
 // ---------------------------------------------------------------- discord
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
+  intents: SPEAK_CHANNEL_MESSAGES
+    ? [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.GuildMessages]
+    : [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
   partials: [Partials.Channel],
 });
 
@@ -383,12 +407,18 @@ class SentenceSink {
     if (this.buf.trim()) this.onSentence(this.buf.trim());
     this.done = true;
   }
+  // Discard the unflushed buffer — used when a tool-round gap shows the text
+  // so far was narration, not the answer.
+  reset() {
+    this.buf = "";
+  }
 }
 
 async function chatAndSpeak(name, text) {
   const apiKey = await llmApiKey();
   const headers = { "content-type": "application/json" };
   if (apiKey) headers.authorization = `Bearer ${apiKey}`;
+  if (LLM_MODEL_HEADER && LLM_MODEL_OVERRIDE) headers[LLM_MODEL_HEADER] = LLM_MODEL_OVERRIDE;
   const userMsg = { role: "user", content: `${name}: ${text}` };
   const payload = {
     model: LLM_MODEL,
@@ -412,6 +442,7 @@ async function chatAndSpeak(name, text) {
 
   const ttsQueue = [];
   let ttsDone = false;
+  let lastDeltaAt = 0;
   const sink = new SentenceSink((s) => {
     log("sentence queued:", s.replace(/\s+/g, " ").slice(0, 120));
     ttsQueue.push(s.slice(0, TTS_MAX_CHARS));
@@ -477,6 +508,22 @@ async function chatAndSpeak(name, text) {
           const delta = JSON.parse(data).choices?.[0]?.delta?.content;
           if (delta) {
             if (DEBUG_VOICE) log("[delta]", JSON.stringify(delta));
+            // Silence longer than SPEAK_GAP_DROP_MS means a tool round just
+            // ran (see its comment above): the text before it was narration.
+            // fullText still accumulates everything — only the speech path
+            // drops it.
+            if (
+              SPEAK_GAP_DROP_MS > 0 &&
+              lastDeltaAt &&
+              Date.now() - lastDeltaAt > SPEAK_GAP_DROP_MS &&
+              (ttsQueue.length > 0 || sink.buf)
+            ) {
+              const dropped = ttsQueue.splice(0).map((s) => s.replace(/\s+/g, " ").slice(0, 40));
+              sink.reset();
+              if (dropped.length) log("gap drop narration:", dropped.join(" | "));
+              else log("gap drop: pending text discarded");
+            }
+            lastDeltaAt = Date.now();
             fullText += delta;
             sink.push(delta);
           }
@@ -642,8 +689,33 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
   }
 });
 
+// Speak the bot's own posts in the voice channel's text chat (the announce
+// path: an agent backend finishing background work has no stream to speak
+// into, so it posts a short line there instead). speakText serializes on the
+// player via playerIdle(), so this can't overlap an in-flight turn's audio;
+// if it interleaves, sentences just queue.
+if (SPEAK_CHANNEL_MESSAGES) {
+  client.on(Events.MessageCreate, async (msg) => {
+    try {
+      if (!connection || msg.channelId !== VOICE_CHANNEL_ID) return;
+      if (!client.user || msg.author.id !== client.user.id) return; // only our own posts
+      // strip markdown emphasis the TTS would read aloud
+      const text = msg.cleanContent.replace(/[*_`~|#>]+/g, " ").replace(/\s+/g, " ").trim();
+      if (!text) return;
+      log("channel message -> speak:", text.slice(0, 160));
+      await speakText(text.slice(0, TTS_MAX_CHARS));
+    } catch (e) {
+      log("channel speak error:", e.message);
+    }
+  });
+}
+
 client.once(Events.ClientReady, async () => {
-  log(`discord voice bridge ready as ${client.user.tag} (model=${LLM_MODEL} user=${LLM_USER})`);
+  log(
+    `discord voice bridge ready as ${client.user.tag} (model=${LLM_MODEL}` +
+      `${LLM_MODEL_OVERRIDE ? ` override=${LLM_MODEL_OVERRIDE}` : ""} user=${LLM_USER}` +
+      `${SPEAK_GAP_DROP_MS ? ` gapDrop=${SPEAK_GAP_DROP_MS}ms` : ""})`
+  );
   if (FORCE_JOIN) {
     try {
       await joinChannel();
@@ -659,7 +731,9 @@ client.once(Events.ClientReady, async () => {
     } catch (e) {
       log("force-join test failed:", e.message);
     }
-    return;
+    // test mode exits either way — otherwise the still-connected client keeps
+    // the process alive forever (a failed join used to hang like this)
+    shutdown();
   }
   await maybeJoin(VOICE_CHANNEL_ID).catch((e) => log("initial join:", e.message));
 });
